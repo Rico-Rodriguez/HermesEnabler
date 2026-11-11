@@ -84,69 +84,106 @@ NSString *BQDocuments(void) {
     return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 }
 
-NSString *BQGroupID(void) {
-    if (!gGroupID) {
-        // Read the app's own entitlements via SecTask. This lets the exploit use
-        // whatever app group the running build actually has, instead of a
-        // hardcoded identifier.
-        void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW);
-        typedef CFTypeRef (*create_fn)(CFAllocatorRef);
-        typedef CFTypeRef (*copy_ent_fn)(CFTypeRef, CFStringRef, CFErrorRef *);
-        create_fn create = (create_fn)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
-        if (!create && sec) create = (create_fn)dlsym(sec, "SecTaskCreateFromSelf");
-        copy_ent_fn copy = (copy_ent_fn)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
-        if (!copy && sec) copy = (copy_ent_fn)dlsym(sec, "SecTaskCopyValueForEntitlement");
-        if (create && copy) {
-            CFTypeRef task = create(kCFAllocatorDefault);
-            if (task) {
-                CFTypeRef val = copy(task, CFSTR("com.apple.security.application-groups"), NULL);
-                if (val) {
-                    if (CFGetTypeID(val) == CFArrayGetTypeID()) {
-                        CFArrayRef arr = (CFArrayRef)val;
-                        NSMutableArray *all = [NSMutableArray array];
-                        for (CFIndex i = 0; i < CFArrayGetCount(arr); i++) {
-                            CFTypeRef x = CFArrayGetValueAtIndex(arr, i);
-                            if (x && CFGetTypeID(x) == CFStringGetTypeID()) {
-                                [all addObject:[(__bridge NSString *)x copy]];
-                            }
-                        }
-                        if (all.count) {
-                            gGroupIDs = [all copy];
-                            gGroupID = all.firstObject;
-                        }
-                    } else if (CFGetTypeID(val) == CFStringGetTypeID()) {
-                        NSString *s = [(__bridge NSString *)val copy];
-                        if (s.length) {
-                            gGroupIDs = @[s];
-                            gGroupID = s;
-                        }
-                    }
-                    CFRelease(val);
-                }
-                CFRelease(task);
-            }
+// Feather (and most on-device signers) keep whatever app-group strings are in
+// the provisioning profile. Those strings often no longer match the identifier
+// baked in at build time: the signer rewrites CFBundleIdentifier, a wildcard
+// profile contains "group.*", or the group was renamed to group.<new bundle id>.
+// Probe the live bundle id instead of trusting one hardcoded group.
+static void bq_add_group(NSMutableArray<NSString *> *groups, NSString *group) {
+    if (group.length < 7 || ![group hasPrefix:@"group."] || [group containsString:@"*"]) return;
+    if (![groups containsObject:group]) [groups addObject:group];
+}
+
+static void bq_add_group_pattern(NSMutableArray<NSString *> *groups, NSString *pattern,
+                                 NSString *bundleID, NSString *companionID) {
+    if (!pattern.length) return;
+    if ([pattern containsString:@"*"]) {
+        for (NSString *ident in @[companionID ?: @"", bundleID ?: @""]) {
+            if (!ident.length) continue;
+            bq_add_group(groups, [pattern stringByReplacingOccurrencesOfString:@"*" withString:ident]);
         }
-        if (!gGroupID) {
-            NSString *defaultGroup = [NSString stringWithFormat:@"group.%@", [[NSBundle mainBundle] bundleIdentifier]];
-            if ([[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:defaultGroup]) {
-                gGroupID = defaultGroup;
-                gGroupIDs = @[defaultGroup];
-            } else if ([[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.com.kamui.escape"]) {
-                gGroupID = @"group.com.kamui.escape";
-                gGroupIDs = @[@"group.com.kamui.escape"];
-            }
-        }
-        BQLog(@"app group entitlement: %@", gGroupID ?: @"(none)");
+        return;
     }
+    bq_add_group(groups, pattern);
+}
+
+static NSArray<NSString *> *bq_entitled_group_patterns(void) {
+    void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW);
+    typedef CFTypeRef (*create_fn)(CFAllocatorRef);
+    typedef CFTypeRef (*copy_ent_fn)(CFTypeRef, CFStringRef, CFErrorRef *);
+    create_fn create = (create_fn)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+    if (!create && sec) create = (create_fn)dlsym(sec, "SecTaskCreateFromSelf");
+    copy_ent_fn copy = (copy_ent_fn)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+    if (!copy && sec) copy = (copy_ent_fn)dlsym(sec, "SecTaskCopyValueForEntitlement");
+    if (!create || !copy) return @[];
+    CFTypeRef task = create(kCFAllocatorDefault);
+    if (!task) return @[];
+    NSMutableArray<NSString *> *patterns = [NSMutableArray array];
+    CFTypeRef val = copy(task, CFSTR("com.apple.security.application-groups"), NULL);
+    if (val) {
+        if (CFGetTypeID(val) == CFArrayGetTypeID()) {
+            CFArrayRef arr = (CFArrayRef)val;
+            for (CFIndex i = 0; i < CFArrayGetCount(arr); i++) {
+                CFTypeRef x = CFArrayGetValueAtIndex(arr, i);
+                if (x && CFGetTypeID(x) == CFStringGetTypeID()) {
+                    NSString *s = [(__bridge NSString *)x copy];
+                    if (s.length) [patterns addObject:s];
+                }
+            }
+        } else if (CFGetTypeID(val) == CFStringGetTypeID()) {
+            NSString *s = [(__bridge NSString *)val copy];
+            if (s.length) [patterns addObject:s];
+        }
+        CFRelease(val);
+    }
+    CFRelease(task);
+    return patterns;
+}
+
+NSString *BQGroupID(void) {
+    if (gGroupIDs) return gGroupID;
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    NSString *companionID = bundleID;
+    NSString *watchSuffix = @".watchkitapp";
+    if (companionID.length > watchSuffix.length && [companionID hasSuffix:watchSuffix]) {
+        companionID = [companionID substringToIndex:companionID.length - watchSuffix.length];
+    }
+
+    NSMutableArray<NSString *> *groups = [NSMutableArray array];
+    NSArray<NSString *> *patterns = bq_entitled_group_patterns();
+    for (NSString *pattern in patterns) {
+        bq_add_group_pattern(groups, pattern, bundleID, companionID);
+    }
+    // The signed entitlement is group.<companion id>. After a signer rewrites
+    // only the bundle id, that group is group.<companion>, not group.<watch id>.
+    if (companionID.length) bq_add_group(groups, [@"group." stringByAppendingString:companionID]);
+    if (bundleID.length) bq_add_group(groups, [@"group." stringByAppendingString:bundleID]);
+    bq_add_group(groups, @"group.com.kamui.escape");
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *resolved = nil;
+    for (NSString *group in groups) {
+        if ([fm containerURLForSecurityApplicationGroupIdentifier:group].path.length) {
+            resolved = group;
+            break;
+        }
+    }
+    gGroupIDs = [groups copy];
+    gGroupID = resolved ?: groups.firstObject;
+    BQLog(@"app group patterns: %@ candidates: %@ resolved=%@",
+          patterns, gGroupIDs, resolved ?: @"(none yet)");
     return gGroupID;
 }
 
 NSString *BQGroupRoot(void) {
-    if (!gGroupRoot) {
-        NSString *group = BQGroupID();
-        if (group.length) {
-            NSURL *u = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:group];
-            gGroupRoot = u.path;
+    if (!gGroupRoot.length) {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *group in BQGroupIDs()) {
+            NSString *path = [fm containerURLForSecurityApplicationGroupIdentifier:group].path;
+            if (!path.length) continue;
+            gGroupRoot = path;
+            gGroupID = group;
+            break;
         }
     }
     return gGroupRoot;

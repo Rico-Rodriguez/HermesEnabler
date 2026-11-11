@@ -5,9 +5,16 @@ usage() {
     cat <<'EOF'
 Usage: scripts/create_ipa.sh [--bundle-id IDENTIFIER] [--output PATH]
 
-Builds an unsigned iOS IPA containing the iPhone companion app and its embedded
-Apple Watch app. Requires macOS, Xcode, and xcodebuild; no signing certificate
-or provisioning profile is used.
+Builds an ad-hoc signed iOS IPA containing the iPhone companion app and its
+embedded Apple Watch app. Requires macOS, Xcode, and xcodebuild. No signing
+certificate, provisioning profile, or Apple account is used. Feather (and
+Sideloadly) can re-sign the IPA with your own certificate.
+
+The watch bundle id is <bundle-id>.watchkitapp and WKCompanionAppBundleIdentifier
+is <bundle-id>. Feather rewrites both by replacing the original bundle id, so
+keep that prefix relationship. The ad-hoc signature carries
+group.<bundle-id> so a re-signer that preserves entitlements keeps the app group
+the watch app looks up at runtime.
 
 Options:
   --bundle-id IDENTIFIER  iOS app bundle ID (watch ID becomes IDENTIFIER.watchkitapp)
@@ -75,7 +82,7 @@ derived_data="$temp_dir/DerivedData"
 app_path="$derived_data/Build/Products/Release-iphoneos/HermesCompanion.app"
 staging_path="$temp_dir/staging"
 
-echo "Building iPhone app and embedded Watch app without code signing..."
+echo "Building iPhone app and embedded Watch app without a certificate..."
 xcodebuild \
     -project "$repo_root/HermesEnabler2.xcodeproj" \
     -scheme HermesCompanion \
@@ -100,16 +107,89 @@ if [[ -z "$watch_app" ]]; then
     exit 1
 fi
 
-if find "$app_path" -name embedded.mobileprovision -print -quit | grep -q .; then
-    echo "A provisioning profile was embedded; refusing to label this IPA unsigned." >&2
+plist_value() {
+    plutil -extract "$2" raw -o - "$1"
+}
+
+companion_id="$(plist_value "$app_path/Info.plist" CFBundleIdentifier)"
+watch_id="$(plist_value "$watch_app/Info.plist" CFBundleIdentifier)"
+watch_companion="$(plist_value "$watch_app/Info.plist" WKCompanionAppBundleIdentifier)"
+watch_exec="$(plist_value "$watch_app/Info.plist" CFBundleExecutable)"
+expected_watch_id="${bundle_id}.watchkitapp"
+
+if [[ "$companion_id" != "$bundle_id" || "$watch_id" != "$expected_watch_id" || "$watch_companion" != "$bundle_id" ]]; then
+    echo "Watch/iPhone bundle relationship is not Feather-safe." >&2
+    echo "  iPhone CFBundleIdentifier: $companion_id" >&2
+    echo "  Watch CFBundleIdentifier: $watch_id" >&2
+    echo "  WKCompanionAppBundleIdentifier: $watch_companion" >&2
+    echo "Expected $bundle_id and $expected_watch_id with WKCompanionAppBundleIdentifier $bundle_id." >&2
     exit 1
 fi
 
+if [[ ! -f "$watch_app/Info.plist" ]]; then
+    echo "Watch app is missing Info.plist. Feather deletes Watch apps without one." >&2
+    exit 1
+fi
+
+# watchOS 26+ devices are arm64. The arm64_32 slice is for watches that cannot
+# run this deployment target, and Feather's zsign has failed to re-sign some
+# fat watch binaries. Keep the arm64 slice only.
+watch_bin="$watch_app/$watch_exec"
+if lipo -info "$watch_bin" 2>/dev/null | grep -q 'arm64_32'; then
+    echo "Thinning Watch executable to arm64..."
+    lipo "$watch_bin" -thin arm64 -output "$watch_bin.arm64"
+    mv "$watch_bin.arm64" "$watch_bin"
+fi
+
+group_id="group.${bundle_id}"
+entitlements="$temp_dir/adhoc.entitlements"
+cat >"$entitlements" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.application-groups</key>
+    <array><string>${group_id}</string></array>
+</dict></plist>
+EOF
+
+sign_bundle() {
+    local target="$1"
+    if codesign --force --sign - --timestamp=none --generate-entitlement-der \
+        --entitlements "$entitlements" "$target"; then
+        return 0
+    fi
+    echo "Retrying ad-hoc signature without a DER entitlement slot..." >&2
+    codesign --force --sign - --timestamp=none --entitlements "$entitlements" "$target"
+}
+
+echo "Ad-hoc signing the Watch app, then the iPhone app..."
+sign_bundle "$watch_app"
+sign_bundle "$app_path"
+
+if find "$app_path" -name embedded.mobileprovision -print -quit | grep -q .; then
+    echo "A provisioning profile was embedded. This IPA must stay free of profiles so Feather can supply yours." >&2
+    exit 1
+fi
+
+codesign --verify --strict "$watch_app"
+codesign --verify --strict "$app_path"
+codesign -d --entitlements :- "$watch_app" 2>/dev/null | grep -F -q "$group_id"
+codesign -d --entitlements :- "$app_path" 2>/dev/null | grep -F -q "$group_id"
+
 mkdir -p "$staging_path/Payload" "$(dirname "$output_path")"
 ditto "$app_path" "$staging_path/Payload/HermesCompanion.app"
+# Payload/ must be the archive root. Feather imports that layout and looks for
+# Watch/*.app with an Info.plist under the iPhone app.
 ditto -c -k --sequesterRsrc --keepParent "$staging_path/Payload" "$output_path"
 
-echo "Created unsigned IPA: $output_path"
+if ! unzip -l "$output_path" | grep -q "Payload/HermesCompanion.app/Watch/.*Info.plist"; then
+    echo "IPA is missing Payload/.../Watch/*.app/Info.plist." >&2
+    unzip -l "$output_path" >&2 || true
+    exit 1
+fi
+
+echo "Created ad-hoc IPA: $output_path"
 echo "Embedded Watch app: Payload/HermesCompanion.app/Watch/$(basename "$watch_app")"
-echo "Bundle IDs: $bundle_id and $bundle_id.watchkitapp"
-echo "Sign the iPhone app and embedded Watch app with your own certificate and profiles before installing."
+echo "Bundle IDs: $bundle_id and $expected_watch_id"
+echo "App group in the ad-hoc signature: $group_id"
+echo "Re-sign with Feather or Sideloadly before installing. No Apple certificate was used."

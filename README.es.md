@@ -10,7 +10,7 @@
 
 ### Instalar el IPA
 
-1. Descarga el IPA desde [Releases](https://github.com/pookjw/HermesEnabler/releases).
+1. Descarga el IPA desde [Releases](https://github.com/Rico-Rodriguez/HermesEnabler/releases).
 2. Instálalo con [Sideloadly](https://sideloadly.io).
 3. En el iPhone, abre la app **Watch → Mi reloj → Apps** e instala **HermesEnabler2**.
 4. Abre **HermesEnabler2** en el Apple Watch y sigue los pasos de la app.

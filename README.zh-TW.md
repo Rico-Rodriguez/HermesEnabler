@@ -10,7 +10,7 @@
 
 ### 安裝 IPA
 
-1. 從 [Releases](https://github.com/pookjw/HermesEnabler/releases) 下載 IPA。
+1. 從 [Releases](https://github.com/Rico-Rodriguez/HermesEnabler/releases) 下載 IPA。
 2. 使用 [Sideloadly](https://sideloadly.io) 安裝。
 3. 在 iPhone 上打開 **Watch（手錶）App → 我的手錶 → App**，安裝 **HermesEnabler2**。
 4. 在 Apple Watch 上打開 **HermesEnabler2**，並依照 app 中的步驟操作。
