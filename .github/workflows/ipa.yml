@@ -1,0 +1,77 @@
+name: Build IPA
+
+on:
+  push:
+    branches:
+      - main
+      - "cursor/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: Ad-hoc IPA
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          if [[ -d /Applications/Xcode_26.6.app ]]; then
+            sudo xcode-select -s /Applications/Xcode_26.6.app
+          else
+            sudo xcode-select -s /Applications/Xcode.app
+          fi
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Build ad-hoc IPA
+        run: bash scripts/create_ipa.sh --output build/ipa/HermesEnabler.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HermesEnabler-ipa
+          path: build/ipa/HermesEnabler.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="feather"
+          cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
+          Ad-hoc signed IPA for re-signing on device with Feather or Sideloadly. No Apple certificate or provisioning profile is included.
+
+          Feather settings that matter:
+
+          - Set Identifier to a bundle id your profile allows. Feather rewrites the watch id to `<identifier>.watchkitapp` and WKCompanionAppBundleIdentifier to `<identifier>`.
+          - Turn PPQ Protection off unless the profile is a wildcard that still matches after the random suffix.
+          - The profile must cover both the iPhone bundle id and `<identifier>.watchkitapp`. Use a wildcard App ID. An explicit iPhone-only profile makes the watch install fail with "integrity could not be verified".
+          - Leave Remove Provisioning off, and do not delete the Watch folder.
+          - Prefer an App Group of `group.<iPhone bundle id>`. The app also accepts `group.<watch bundle id>`, a renamed group, and a `group.*` wildcard. watchOS 27.2 needs an app group for Backup MG. Development and ad-hoc profiles must include the Apple Watch UDID.
+
+          After the iPhone app is installed, install HermesEnabler2 from the iPhone Watch app.
+          EOF
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" build/ipa/HermesEnabler.ipa --clobber
+            gh release edit "$tag" --title "HermesEnabler Feather IPA" --notes-file "$RUNNER_TEMP/release-notes.md" --latest
+          else
+            gh release create "$tag" build/ipa/HermesEnabler.ipa \
+              --title "HermesEnabler Feather IPA" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --latest
+          fi
+          gh release view "$tag" --json url,assets --jq '{url: .url, assets: [.assets[].name]}'
